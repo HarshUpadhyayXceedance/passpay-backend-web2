@@ -56,26 +56,33 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // 2. Verify ticket ownership
-    const hasTicket = await verifyTicketOwnership(wallet.pubkey, eventPda);
-    if (!hasTicket) {
-      res.status(403).json({
-        error: "No valid ticket found",
-        details: "You need to purchase a ticket for this event to join the meeting",
-      });
-      return;
+    // 2. Check if the wallet is the event admin (organizer)
+    //    Admins bypass ticket check and always get speaker rights.
+    const isEventAdmin = wallet.pubkey === eventInfo.adminPubkey;
+
+    // 3. Verify ticket ownership (skip for event admin)
+    if (!isEventAdmin) {
+      const hasTicket = await verifyTicketOwnership(wallet.pubkey, eventPda);
+      if (!hasTicket) {
+        res.status(403).json({
+          error: "No valid ticket found",
+          details: "You need to purchase a ticket for this event to join the meeting",
+        });
+        return;
+      }
     }
 
-    // 3. Find or create the meeting room for this event
+    // 4. Find or create the meeting room for this event
     const meetingRoomId = `meeting-${eventPda}`;
     let room = await getRoom(meetingRoomId);
 
     if (!room) {
       // First person joining — create the meeting room
+      // Admin is always set as creator regardless of who joins first
       const now = Date.now();
       room = {
         id: meetingRoomId,
-        creator: wallet.pubkey,
+        creator: eventInfo.adminPubkey, // admin is always the room creator (host)
         title: `Event Meeting`,
         type: "ticket",
         eventPda,
@@ -87,19 +94,19 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       await createRoom(room);
     }
 
-    // 4. Check capacity
+    // 5. Check capacity
     const count = await getParticipantCount(meetingRoomId);
     if (count >= room.maxParticipants) {
       res.status(403).json({ error: "Meeting is full" });
       return;
     }
 
-    // 5. Add participant
+    // 6. Add participant
     const newCount = await addParticipant(meetingRoomId, wallet.pubkey);
 
-    // 6. Generate LiveKit token
-    // Room creator gets speaker rights; others are listeners by default
-    const canPublish = wallet.pubkey === room.creator;
+    // 7. Generate LiveKit token
+    // Admin always gets speaker rights; room creator gets speaker rights; others are listeners
+    const canPublish = isEventAdmin || wallet.pubkey === room.creator;
 
     let token: string | null = null;
     let livekitUrl: string | null = null;

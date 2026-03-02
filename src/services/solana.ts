@@ -5,7 +5,6 @@ import { env } from "../config/env";
 const PROGRAM_ID = new PublicKey(env.programId);
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TICKET_SEED = Buffer.from("ticket");
-const EVENT_SEED = Buffer.from("event");
 
 let connection: Connection;
 
@@ -55,7 +54,7 @@ export async function verifyTicketOwnership(
       // Check if this ticket PDA exists on-chain
       const ticketInfo = await conn.getAccountInfo(ticketPda);
       if (ticketInfo && ticketInfo.data.length >= 127) {
-        // Verify the ticket's event field matches (event pubkey at offset 8)
+        // event pubkey is at offset 8 (after 8-byte discriminator)
         const ticketEvent = new PublicKey(ticketInfo.data.subarray(8, 40));
         if (ticketEvent.equals(event)) {
           return true;
@@ -71,58 +70,51 @@ export async function verifyTicketOwnership(
 }
 
 /**
- * Check if an event exists and is active on-chain.
- * Reads the Event account and checks is_active flag.
+ * Check if an event exists, is active, is online, and return who the admin is.
  *
- * Event struct layout (relevant fields):
+ * Event struct layout (after is_online field added):
  *   disc(8) + admin(32) + name(4+N) + venue(4+N) + desc(4+N) + image(4+N)
  *   + event_date(8) + base_ticket_price(8) + current_ticket_price(8)
- *   + total_seats(4) + tickets_sold(4) + is_active(1) + is_cancelled(1)
- *
- * For simplicity, we just check that the account exists and has data.
- * The venue field tells us if it's online or offline.
+ *   + total_seats(4) + tickets_sold(4) + is_active(1) + is_cancelled(1) + is_online(1) + ...
  */
 export async function getEventInfo(eventPda: string): Promise<{
   exists: boolean;
   isActive: boolean;
   isOnline: boolean;
+  eventType: "online" | "offline";
+  adminPubkey: string;
 } | null> {
   const conn = getConnection();
   try {
     const info = await conn.getAccountInfo(new PublicKey(eventPda));
     if (!info || info.data.length < 50) return null;
 
-    // The Event struct has variable-length string fields, so we need to
-    // parse through them to find is_active.
-    // For hackathon: trust the account exists = event is valid.
-    // A more thorough check would fully deserialize the struct.
+    // disc(8) + admin(32) — admin pubkey is at bytes 8–40
+    const adminPubkey = new PublicKey(info.data.subarray(8, 40)).toBase58();
 
-    // Read the venue string to determine online/offline
-    // After disc(8) + admin(32) = offset 40
-    // name is a Borsh string: 4-byte length prefix + bytes
+    // Parse through variable-length string fields
     let offset = 40;
+
+    // name: 4-byte length prefix + bytes
     const nameLen = info.data.readUInt32LE(offset);
     offset += 4 + nameLen;
 
-    // venue: 4-byte length + bytes
+    // venue: 4-byte length prefix + bytes
     const venueLen = info.data.readUInt32LE(offset);
     const venueBytes = info.data.subarray(offset + 4, offset + 4 + venueLen);
     const venue = Buffer.from(venueBytes).toString("utf-8");
     offset += 4 + venueLen;
 
-    // Skip description
+    // description
     const descLen = info.data.readUInt32LE(offset);
     offset += 4 + descLen;
 
-    // Skip image_url
+    // image_url
     const imgLen = info.data.readUInt32LE(offset);
     offset += 4 + imgLen;
 
-    // Skip event_date(8) + base_ticket_price(8) + current_ticket_price(8)
-    offset += 24;
-
-    // Skip total_seats(4) + tickets_sold(4)
-    offset += 8;
+    // event_date(8) + base_ticket_price(8) + current_ticket_price(8) + total_seats(4) + tickets_sold(4)
+    offset += 32;
 
     // is_active: 1 byte
     const isActive = info.data[offset] !== 0;
@@ -130,13 +122,22 @@ export async function getEventInfo(eventPda: string): Promise<{
 
     // is_cancelled: 1 byte
     const isCancelled = info.data[offset] !== 0;
+    offset += 1;
 
-    const isOnline = venue.toLowerCase().startsWith("online");
+    // is_online: 1 byte (new field — fall back to venue-name detection for old accounts)
+    let isOnline: boolean;
+    if (offset < info.data.length) {
+      isOnline = info.data[offset] !== 0;
+    } else {
+      isOnline = venue.toLowerCase().startsWith("online");
+    }
 
     return {
       exists: true,
       isActive: isActive && !isCancelled,
       isOnline,
+      eventType: isOnline ? "online" : "offline",
+      adminPubkey,
     };
   } catch (error) {
     console.error("[Solana] Event info fetch failed:", error);

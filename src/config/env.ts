@@ -5,7 +5,7 @@ export const env = {
   port: parseInt(process.env.PORT || "3001", 10),
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   solanaRpcUrl: process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com",
-  programId: process.env.PROGRAM_ID || "EvvNmUExCReSFVovKJsqXumDk7XB1G8TodtVfKQPJ7Xw",
+  programId: process.env.PROGRAM_ID || "H57pHZjc5xTpRCruvdqtRn1XfQJL3D8gYGssE4wMLDUd",
   livekit: {
     apiKey: process.env.LIVEKIT_API_KEY || "",
     apiSecret: process.env.LIVEKIT_API_SECRET || "",
