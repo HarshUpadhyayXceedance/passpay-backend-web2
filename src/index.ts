@@ -5,6 +5,7 @@ import { connectRedis } from "./services/redis";
 import { isLiveKitConfigured } from "./services/livekit";
 import roomRoutes from "./routes/rooms";
 import meetingRoutes from "./routes/meetings";
+import authRoutes from "./routes/auth";
 
 const app = express();
 
@@ -13,6 +14,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Routes ────────────────────────────────────────────────
+app.use("/api/auth", authRoutes);
 app.use("/api/rooms", roomRoutes);
 app.use("/api/meetings", meetingRoutes);
 

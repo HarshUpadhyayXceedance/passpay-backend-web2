@@ -1,37 +1,59 @@
+/**
+ * walletAuth middleware
+ *
+ * Auth formats (in priority order):
+ *
+ *  1. JWT (required in production):  Authorization: Bearer <token>
+ *     Issued by POST /api/auth after Phantom signs a challenge message.
+ *
+ *  2. Raw pubkey (dev only):  x-wallet-pubkey: <base58>
+ *     No cryptographic proof. Only active when ALLOW_LEGACY_AUTH=true.
+ *     NEVER enable in production — any client can impersonate any wallet.
+ */
 import { Request, Response, NextFunction } from "express";
 import bs58 from "bs58";
+import { verifyToken } from "../services/jwt";
+import { env } from "../config/env";
 import { WalletAuth } from "../types";
 
-/**
- * Wallet identity middleware.
- *
- * Expects header:
- *   x-wallet-pubkey: base58 Solana public key
- *
- * The real security gate for meetings is on-chain ticket ownership verification.
- * Community rooms use LiveKit tokens (server-signed) as the access control layer.
- */
 export function walletAuth(req: Request, res: Response, next: NextFunction): void {
-  const pubkeyHeader = req.headers["x-wallet-pubkey"] as string | undefined;
-
-  if (!pubkeyHeader) {
-    res.status(401).json({ error: "Missing x-wallet-pubkey header" });
-    return;
-  }
-
-  try {
-    const bytes = bs58.decode(pubkeyHeader);
-    if (bytes.length !== 32) {
-      res.status(401).json({ error: "Invalid public key" });
+  // ── 1. Try JWT Bearer token ───────────────────────────────────────────
+  const authHeader = req.headers["authorization"] as string | undefined;
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    const payload = verifyToken(token, env.jwtSecret);
+    if (!payload) {
+      res.status(401).json({ error: "Invalid or expired token. Please reconnect your wallet." });
       return;
     }
-  } catch {
-    res.status(401).json({ error: "Invalid public key encoding" });
+    (req as Request & { wallet: WalletAuth }).wallet = { pubkey: payload.sub };
+    next();
     return;
   }
 
-  (req as Request & { wallet: WalletAuth }).wallet = { pubkey: pubkeyHeader };
-  next();
+  // ── 2. Legacy pubkey header (dev only, disabled by default) ──────────
+  if (env.allowLegacyAuth) {
+    const pubkeyHeader = req.headers["x-wallet-pubkey"] as string | undefined;
+    if (pubkeyHeader) {
+      try {
+        const bytes = bs58.decode(pubkeyHeader);
+        if (bytes.length !== 32) {
+          res.status(401).json({ error: "Invalid public key" });
+          return;
+        }
+      } catch {
+        res.status(401).json({ error: "Invalid public key encoding" });
+        return;
+      }
+      console.warn(`[Auth] Legacy pubkey-only access from ${pubkeyHeader.slice(0, 8)}...`);
+      (req as Request & { wallet: WalletAuth }).wallet = { pubkey: pubkeyHeader };
+      next();
+      return;
+    }
+  }
+
+  // ── 3. No valid auth provided ─────────────────────────────────────────
+  res.status(401).json({ error: "Authentication required. Connect your wallet." });
 }
 
 export function getWallet(req: Request): WalletAuth {

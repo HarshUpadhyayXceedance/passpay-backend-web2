@@ -6,13 +6,30 @@ const PROGRAM_ID = new PublicKey(env.programId);
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TICKET_SEED = Buffer.from("ticket");
 
-let connection: Connection;
+// Singleton connection — recreated if an RPC error forces a reset.
+// Both functions use "finalized" so reads are consistent with on-chain finality.
+let connection: Connection | null = null;
 
 function getConnection(): Connection {
   if (!connection) {
-    connection = new Connection(env.solanaRpcUrl, "confirmed");
+    connection = new Connection(env.solanaRpcUrl, "finalized");
   }
   return connection;
+}
+
+/** Call after an unexpected RPC error so the next request gets a fresh connection. */
+function resetConnection(): void {
+  connection = null;
+}
+
+/** Returns true when `str` is a valid 32-byte Solana base58 public key. */
+export function isValidSolanaPubkey(str: string): boolean {
+  try {
+    new PublicKey(str);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -22,51 +39,82 @@ function getConnection(): Connection {
  * 1. Get all SPL token accounts owned by the user
  * 2. For each token with balance >= 1, derive the ticket PDA
  * 3. Check if the ticket PDA exists and belongs to the target event
+ *
+ * Throws on RPC / network failure so callers can return 503 instead of
+ * silently treating the error as "no ticket found".
  */
 export async function verifyTicketOwnership(
   userPubkey: string,
   eventPda: string
 ): Promise<boolean> {
+  const result = await getTicketStatus(userPubkey, eventPda);
+  return result.hasTicket;
+}
+
+/**
+ * Get full ticket status for a wallet + event combination.
+ *
+ * Ticket struct byte layout (127 bytes total):
+ *   disc(8) + event(32) + owner(32) + mint(32) + seat_number(4)
+ *   + seat_tier(1) + is_checked_in(1) + checked_in_at(8) + price_paid(8) + bump(1)
+ *
+ * is_checked_in is at byte offset 109.
+ *
+ * NOTE: Update the offset comment above if the Ticket struct ever changes.
+ *
+ * @throws if the RPC call fails (network error, rate limit, etc.)
+ */
+export async function getTicketStatus(
+  userPubkey: string,
+  eventPda: string
+): Promise<{ hasTicket: boolean; isCheckedIn: boolean; ticketMint: string | null }> {
   const conn = getConnection();
   const user = new PublicKey(userPubkey);
   const event = new PublicKey(eventPda);
 
+  // Any exception here is a genuine RPC/network failure — reset the connection
+  // so the next caller gets a fresh one, then re-throw to signal 503 upstream.
+  let tokenAccounts;
   try {
-    // Get all token accounts for this user
-    const tokenAccounts = await conn.getTokenAccountsByOwner(user, {
+    tokenAccounts = await conn.getTokenAccountsByOwner(user, {
       programId: TOKEN_PROGRAM_ID,
     });
+  } catch (error: any) {
+    resetConnection();
+    throw new Error(`[Solana] RPC error fetching token accounts: ${error.message}`);
+  }
 
-    for (const { account } of tokenAccounts.value) {
-      const data = AccountLayout.decode(account.data);
+  for (const { account } of tokenAccounts.value) {
+    const data = AccountLayout.decode(account.data);
+    if (data.amount < 1n) continue;
 
-      // Only check tokens with balance >= 1 (user holds the NFT)
-      if (data.amount < 1n) continue;
+    const mint = data.mint;
 
-      const mint = data.mint;
+    const [ticketPda] = PublicKey.findProgramAddressSync(
+      [TICKET_SEED, event.toBuffer(), mint.toBuffer()],
+      PROGRAM_ID
+    );
 
-      // Derive ticket PDA: seeds = ["ticket", eventPda, mint]
-      const [ticketPda] = PublicKey.findProgramAddressSync(
-        [TICKET_SEED, event.toBuffer(), mint.toBuffer()],
-        PROGRAM_ID
-      );
-
-      // Check if this ticket PDA exists on-chain
-      const ticketInfo = await conn.getAccountInfo(ticketPda);
-      if (ticketInfo && ticketInfo.data.length >= 127) {
-        // event pubkey is at offset 8 (after 8-byte discriminator)
-        const ticketEvent = new PublicKey(ticketInfo.data.subarray(8, 40));
-        if (ticketEvent.equals(event)) {
-          return true;
-        }
-      }
+    let ticketInfo;
+    try {
+      ticketInfo = await conn.getAccountInfo(ticketPda, "finalized");
+    } catch (error: any) {
+      resetConnection();
+      throw new Error(`[Solana] RPC error fetching ticket account: ${error.message}`);
     }
 
-    return false;
-  } catch (error) {
-    console.error("[Solana] Ticket verification failed:", error);
-    return false;
+    if (ticketInfo && ticketInfo.data.length >= 127) {
+      const ticketEvent = new PublicKey(ticketInfo.data.subarray(8, 40));
+      if (ticketEvent.equals(event)) {
+        // is_checked_in is a bool at byte offset 109
+        // Layout: disc(8)+event(32)+owner(32)+mint(32)+seat_number(4)+seat_tier(1) = 109
+        const isCheckedIn = ticketInfo.data[109] !== 0;
+        return { hasTicket: true, isCheckedIn, ticketMint: mint.toBase58() };
+      }
+    }
   }
+
+  return { hasTicket: false, isCheckedIn: false, ticketMint: null };
 }
 
 /**
@@ -76,6 +124,9 @@ export async function verifyTicketOwnership(
  *   disc(8) + admin(32) + name(4+N) + venue(4+N) + desc(4+N) + image(4+N)
  *   + event_date(8) + base_ticket_price(8) + current_ticket_price(8)
  *   + total_seats(4) + tickets_sold(4) + is_active(1) + is_cancelled(1) + is_online(1) + ...
+ *
+ * Returns null only when the account does not exist on-chain.
+ * @throws if the RPC call fails (network error, rate limit, etc.)
  */
 export async function getEventInfo(eventPda: string): Promise<{
   exists: boolean;
@@ -83,64 +134,72 @@ export async function getEventInfo(eventPda: string): Promise<{
   isOnline: boolean;
   eventType: "online" | "offline";
   adminPubkey: string;
+  /** Event start time as Unix timestamp in seconds (0 if unreadable) */
+  eventDate: number;
 } | null> {
   const conn = getConnection();
+
+  let info;
   try {
-    const info = await conn.getAccountInfo(new PublicKey(eventPda));
-    if (!info || info.data.length < 50) return null;
-
-    // disc(8) + admin(32) — admin pubkey is at bytes 8–40
-    const adminPubkey = new PublicKey(info.data.subarray(8, 40)).toBase58();
-
-    // Parse through variable-length string fields
-    let offset = 40;
-
-    // name: 4-byte length prefix + bytes
-    const nameLen = info.data.readUInt32LE(offset);
-    offset += 4 + nameLen;
-
-    // venue: 4-byte length prefix + bytes
-    const venueLen = info.data.readUInt32LE(offset);
-    const venueBytes = info.data.subarray(offset + 4, offset + 4 + venueLen);
-    const venue = Buffer.from(venueBytes).toString("utf-8");
-    offset += 4 + venueLen;
-
-    // description
-    const descLen = info.data.readUInt32LE(offset);
-    offset += 4 + descLen;
-
-    // image_url
-    const imgLen = info.data.readUInt32LE(offset);
-    offset += 4 + imgLen;
-
-    // event_date(8) + base_ticket_price(8) + current_ticket_price(8) + total_seats(4) + tickets_sold(4)
-    offset += 32;
-
-    // is_active: 1 byte
-    const isActive = info.data[offset] !== 0;
-    offset += 1;
-
-    // is_cancelled: 1 byte
-    const isCancelled = info.data[offset] !== 0;
-    offset += 1;
-
-    // is_online: 1 byte (new field — fall back to venue-name detection for old accounts)
-    let isOnline: boolean;
-    if (offset < info.data.length) {
-      isOnline = info.data[offset] !== 0;
-    } else {
-      isOnline = venue.toLowerCase().startsWith("online");
-    }
-
-    return {
-      exists: true,
-      isActive: isActive && !isCancelled,
-      isOnline,
-      eventType: isOnline ? "online" : "offline",
-      adminPubkey,
-    };
-  } catch (error) {
-    console.error("[Solana] Event info fetch failed:", error);
-    return null;
+    info = await conn.getAccountInfo(new PublicKey(eventPda), "finalized");
+  } catch (error: any) {
+    resetConnection();
+    throw new Error(`[Solana] RPC error fetching event account: ${error.message}`);
   }
+
+  // Account doesn't exist — return null (not an error)
+  if (!info || info.data.length < 50) return null;
+
+  // disc(8) + admin(32) — admin pubkey is at bytes 8–40
+  const adminPubkey = new PublicKey(info.data.subarray(8, 40)).toBase58();
+
+  // Parse through variable-length string fields (Borsh: 4-byte length prefix + UTF-8 bytes)
+  let offset = 40;
+
+  // name
+  const nameLen = info.data.readUInt32LE(offset);
+  offset += 4 + nameLen;
+
+  // venue (also used as fallback online-detection for old accounts without is_online)
+  const venueLen = info.data.readUInt32LE(offset);
+  const venueBytes = info.data.subarray(offset + 4, offset + 4 + venueLen);
+  const venue = Buffer.from(venueBytes).toString("utf-8");
+  offset += 4 + venueLen;
+
+  // description
+  const descLen = info.data.readUInt32LE(offset);
+  offset += 4 + descLen;
+
+  // image_url
+  const imgLen = info.data.readUInt32LE(offset);
+  offset += 4 + imgLen;
+
+  // event_date(8) + base_ticket_price(8) + current_ticket_price(8) + total_seats(4) + tickets_sold(4)
+  const eventDate = Number(info.data.readBigInt64LE(offset));
+  offset += 32;
+
+  // is_active: 1 byte
+  const isActive = info.data[offset] !== 0;
+  offset += 1;
+
+  // is_cancelled: 1 byte
+  const isCancelled = info.data[offset] !== 0;
+  offset += 1;
+
+  // is_online: 1 byte (added in latest deployment; fall back to venue-name for old accounts)
+  let isOnline: boolean;
+  if (offset < info.data.length) {
+    isOnline = info.data[offset] !== 0;
+  } else {
+    isOnline = venue.toLowerCase().startsWith("online");
+  }
+
+  return {
+    exists: true,
+    isActive: isActive && !isCancelled,
+    isOnline,
+    eventType: isOnline ? "online" : "offline",
+    adminPubkey,
+    eventDate,
+  };
 }

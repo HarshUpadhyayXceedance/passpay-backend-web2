@@ -1,46 +1,52 @@
 import { Router, Request, Response } from "express";
 import { walletAuth, getWallet } from "../middleware/walletAuth";
-import { verifyTicketOwnership, getEventInfo } from "../services/solana";
+import { getTicketStatus, getEventInfo, isValidSolanaPubkey } from "../services/solana";
 import { generateLiveKitToken, getLiveKitUrl, isLiveKitConfigured } from "../services/livekit";
 import {
   getRoom,
   createRoom,
   addParticipant,
   getParticipantCount,
-  listActiveRooms,
   getRoomWithCount,
+  checkRateLimit,
 } from "../services/redis";
-import { v4 as uuidv4 } from "uuid";
 import { env } from "../config/env";
 
 const router = Router();
 
-/**
- * POST /api/meetings/:eventPda/join
- * Join a token-gated event meeting.
- *
- * Flow:
- * 1. Verify wallet signature (middleware)
- * 2. Check event exists and is online
- * 3. Verify user owns a ticket NFT for this event
- * 4. Create or find the meeting room for this event
- * 5. Issue LiveKit token
- *
- * The event creator (admin) gets speaker rights.
- * Everyone else joins as a listener.
- */
+/** Validate that a route param is a legitimate Solana public key. */
+function validateEventPda(eventPda: string | undefined, res: Response): boolean {
+  if (!eventPda || !isValidSolanaPubkey(eventPda)) {
+    res.status(400).json({ error: "Invalid event PDA — must be a valid Solana public key" });
+    return false;
+  }
+  return true;
+}
+
 router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const { eventPda } = req.params;
 
-  if (!eventPda || eventPda.length < 32) {
-    res.status(400).json({ error: "Invalid event PDA" });
-    return;
-  }
+  if (!validateEventPda(eventPda, res)) return;
 
   try {
-    // 1. Check the event on-chain
-    const eventInfo = await getEventInfo(eventPda);
+    // ── Rate limit: max 10 join attempts per wallet per event per hour ────
+    const rateKey = `rate:meeting:join:${eventPda}:${wallet.pubkey}`;
+    const allowed = await checkRateLimit(rateKey, 10, 3600);
+    if (!allowed) {
+      res.status(429).json({ error: "Too many join attempts. Please wait before trying again." });
+      return;
+    }
+
+    // ── 1. Verify event on-chain ──────────────────────────────────────────
+    let eventInfo;
+    try {
+      eventInfo = await getEventInfo(eventPda);
+    } catch {
+      res.status(503).json({ error: "Blockchain temporarily unavailable. Please try again shortly." });
+      return;
+    }
+
     if (!eventInfo || !eventInfo.exists) {
       res.status(404).json({ error: "Event not found" });
       return;
@@ -56,33 +62,61 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // 2. Check if the wallet is the event admin (organizer)
-    //    Admins bypass ticket check and always get speaker rights.
+    // ── 2. Event date gate: allow entry up to 15 min before start ─────────
+    const nowSec = Math.floor(Date.now() / 1000);
+    const EARLY_ENTRY_BUFFER_SEC = 15 * 60;
+    if (eventInfo.eventDate > 0 && nowSec < eventInfo.eventDate - EARLY_ENTRY_BUFFER_SEC) {
+      const minutesUntilOpen = Math.ceil((eventInfo.eventDate - EARLY_ENTRY_BUFFER_SEC - nowSec) / 60);
+      res.status(403).json({
+        error: `Meeting not open yet. Access opens ${minutesUntilOpen} minute(s) before the event starts.`,
+        eventDate: eventInfo.eventDate,
+        opensAt: eventInfo.eventDate - EARLY_ENTRY_BUFFER_SEC,
+      });
+      return;
+    }
+
+    // ── 3. Admin bypass — event creator always gets speaker rights ────────
     const isEventAdmin = wallet.pubkey === eventInfo.adminPubkey;
 
-    // 3. Verify ticket ownership (skip for event admin)
+    // ── 4. Ticket verification for non-admins ─────────────────────────────
     if (!isEventAdmin) {
-      const hasTicket = await verifyTicketOwnership(wallet.pubkey, eventPda);
-      if (!hasTicket) {
+      let ticketStatus;
+      try {
+        ticketStatus = await getTicketStatus(wallet.pubkey, eventPda);
+      } catch {
+        // RPC failure — don't falsely deny access; surface as a transient error
+        res.status(503).json({ error: "Unable to verify ticket ownership. Please try again shortly." });
+        return;
+      }
+
+      if (!ticketStatus.hasTicket) {
         res.status(403).json({
           error: "No valid ticket found",
-          details: "You need to purchase a ticket for this event to join the meeting",
+          details: "Purchase a ticket for this event to join the meeting.",
+        });
+        return;
+      }
+
+      if (ticketStatus.isCheckedIn) {
+        res.status(403).json({
+          error: "Attendance already confirmed",
+          details:
+            "Your attendance for this event has been confirmed and your ticket has been used. " +
+            "Re-entry is not permitted.",
         });
         return;
       }
     }
 
-    // 4. Find or create the meeting room for this event
+    // ── 5. Find or create the meeting room ────────────────────────────────
     const meetingRoomId = `meeting-${eventPda}`;
     let room = await getRoom(meetingRoomId);
 
     if (!room) {
-      // First person joining — create the meeting room
-      // Admin is always set as creator regardless of who joins first
       const now = Date.now();
       room = {
         id: meetingRoomId,
-        creator: eventInfo.adminPubkey, // admin is always the room creator (host)
+        creator: eventInfo.adminPubkey,
         title: `Event Meeting`,
         type: "ticket",
         eventPda,
@@ -94,18 +128,15 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       await createRoom(room);
     }
 
-    // 5. Check capacity
+    // ── 6. Check capacity ─────────────────────────────────────────────────
     const count = await getParticipantCount(meetingRoomId);
     if (count >= room.maxParticipants) {
       res.status(403).json({ error: "Meeting is full" });
       return;
     }
 
-    // 6. Add participant
+    // ── 7. Add participant + issue LiveKit token ───────────────────────────
     const newCount = await addParticipant(meetingRoomId, wallet.pubkey);
-
-    // 7. Generate LiveKit token
-    // Admin always gets speaker rights; room creator gets speaker rights; others are listeners
     const canPublish = isEventAdmin || wallet.pubkey === room.creator;
 
     let token: string | null = null;
@@ -127,25 +158,29 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
   }
 });
 
-/**
- * POST /api/meetings/:eventPda/request-speak
- * Request speaker access in a meeting.
- * For now, auto-grants. In production, this could notify the host.
- */
 router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const { eventPda } = req.params;
 
-  const meetingRoomId = `meeting-${eventPda}`;
-  const room = await getRoom(meetingRoomId);
-
-  if (!room) {
-    res.status(404).json({ error: "Meeting not found" });
-    return;
-  }
+  if (!validateEventPda(eventPda, res)) return;
 
   try {
-    // Re-issue token with publish rights
+    // ── Rate limit: 5 speaker requests per wallet per event per 10 min ────
+    const rateKey = `rate:meeting:speak:${eventPda}:${wallet.pubkey}`;
+    const allowed = await checkRateLimit(rateKey, 5, 600);
+    if (!allowed) {
+      res.status(429).json({ error: "Too many speaker requests. Please wait before trying again." });
+      return;
+    }
+
+    const meetingRoomId = `meeting-${eventPda}`;
+    const room = await getRoom(meetingRoomId);
+
+    if (!room) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
@@ -153,24 +188,18 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
       livekitUrl = getLiveKitUrl();
     }
 
-    res.json({
-      granted: true,
-      token,
-      livekitUrl,
-      role: "speaker",
-    });
+    res.json({ granted: true, token, livekitUrl, role: "speaker" });
   } catch (error: any) {
     console.error("[Meetings] Request speak error:", error.message);
     res.status(500).json({ error: "Failed to grant speaker access" });
   }
 });
 
-/**
- * GET /api/meetings/:eventPda/info
- * Get meeting info for an event (public — shows if meeting is active + participant count)
- */
 router.get("/:eventPda/info", async (req: Request, res: Response) => {
   const { eventPda } = req.params;
+
+  if (!validateEventPda(eventPda, res)) return;
+
   const meetingRoomId = `meeting-${eventPda}`;
 
   try {

@@ -142,3 +142,27 @@ function deserializeRoom(data: Record<string, string>): Room {
     expiresAt: parseInt(data.expiresAt, 10),
   };
 }
+
+// ─── Rate Limiting ──────────────────────────────────────────
+
+/**
+ * Increment and check a rate limit counter for a given key.
+ * Returns true if the request is allowed, false if the rate limit is exceeded.
+ *
+ * @param key     Unique rate limit key (e.g. `rate:meeting:join:{eventPda}:{wallet}`)
+ * @param limit   Max allowed requests within the window
+ * @param windowS Window duration in seconds
+ */
+export async function checkRateLimit(
+  key: string,
+  limit: number,
+  windowS: number
+): Promise<boolean> {
+  const r = getRedis();
+  const count = await r.incr(key);
+  if (count === 1) {
+    // First request — set expiry for the window
+    await r.expire(key, windowS);
+  }
+  return count <= limit;
+}

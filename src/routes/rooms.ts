@@ -10,6 +10,7 @@ import {
   addParticipant,
   removeParticipant,
   getParticipantCount,
+  checkRateLimit,
 } from "../services/redis";
 import { generateLiveKitToken, getLiveKitUrl, isLiveKitConfigured } from "../services/livekit";
 import { env } from "../config/env";
@@ -80,6 +81,14 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
   }
 
   try {
+    // Rate limit: max 5 room creations per wallet per hour
+    const createRateKey = `rate:rooms:create:${wallet.pubkey}`;
+    const allowed = await checkRateLimit(createRateKey, 5, 3600);
+    if (!allowed) {
+      res.status(429).json({ error: "Too many rooms created. Please wait before creating another." });
+      return;
+    }
+
     const roomId = uuidv4();
     const now = Date.now();
 
@@ -100,7 +109,7 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
     // Auto-join the creator
     await addParticipant(roomId, wallet.pubkey);
 
-    // Generate LiveKit token for creator (always a speaker)
+    // Community rooms: creator (and all members) are speakers — mic state determines label
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
@@ -112,6 +121,7 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
       room: { ...room, participantCount: 1 },
       token,
       livekitUrl,
+      role: "speaker",
     });
   } catch (error: any) {
     console.error("[Rooms] Create error:", error.message);
@@ -128,6 +138,14 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
   const roomId = req.params.id;
 
   try {
+    // Rate limit: max 20 join attempts per wallet per hour across all rooms
+    const joinRateKey = `rate:rooms:join:${wallet.pubkey}`;
+    const joinAllowed = await checkRateLimit(joinRateKey, 20, 3600);
+    if (!joinAllowed) {
+      res.status(429).json({ error: "Too many join attempts. Please wait before trying again." });
+      return;
+    }
+
     const room = await getRoom(roomId);
     if (!room) {
       res.status(404).json({ error: "Room not found or expired" });
@@ -144,13 +162,12 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
     // Add participant
     const newCount = await addParticipant(roomId, wallet.pubkey);
 
-    // Generate LiveKit token
-    // Creator gets publish rights (speaker), others join as listeners
-    const canPublish = wallet.pubkey === room.creator;
+    // Community rooms: all members are speakers (can publish audio/video)
+    // Mic state on the client determines speaker vs listener label
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
-      token = await generateLiveKitToken(room.livekitRoom, wallet.pubkey, canPublish);
+      token = await generateLiveKitToken(room.livekitRoom, wallet.pubkey, true);
       livekitUrl = getLiveKitUrl();
     }
 
@@ -158,6 +175,7 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
       room: { ...room, participantCount: newCount },
       token,
       livekitUrl,
+      role: "speaker",
     });
   } catch (error: any) {
     console.error("[Rooms] Join error:", error.message);
@@ -181,12 +199,7 @@ router.post("/:id/leave", walletAuth, async (req: Request, res: Response) => {
     }
 
     const remaining = await removeParticipant(roomId, wallet.pubkey);
-
-    // Auto-delete room if empty
-    if (remaining === 0) {
-      await deleteRoom(roomId);
-    }
-
+    // Do NOT auto-delete empty rooms — rely on Redis TTL so creators can re-join after app restarts
     res.json({ success: true, participantCount: remaining });
   } catch (error: any) {
     console.error("[Rooms] Leave error:", error.message);
