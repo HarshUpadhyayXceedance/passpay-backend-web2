@@ -97,15 +97,8 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
         return;
       }
 
-      if (ticketStatus.isCheckedIn) {
-        res.status(403).json({
-          error: "Attendance already confirmed",
-          details:
-            "Your attendance for this event has been confirmed and your ticket has been used. " +
-            "Re-entry is not permitted.",
-        });
-        return;
-      }
+      // Note: isCheckedIn=true is allowed — attendance confirmation and room participation
+      // are independent. A user who confirmed attendance can still re-join the meeting.
     }
 
     // ── 5. Find or create the meeting room ────────────────────────────────
