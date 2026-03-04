@@ -8,6 +8,7 @@ import {
   addParticipant,
   getParticipantCount,
   getRoomWithCount,
+  deleteRoom,
   checkRateLimit,
 } from "../services/redis";
 import { env } from "../config/env";
@@ -185,6 +186,51 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
   } catch (error: any) {
     console.error("[Meetings] Request speak error:", error.message);
     res.status(500).json({ error: "Failed to grant speaker access" });
+  }
+});
+
+/**
+ * DELETE /api/meetings/:eventPda/end
+ *
+ * Admin-only: ends the meeting by removing the Redis room entry.
+ * After this, any join attempt returns 404 "Meeting not found".
+ * The event itself stays open on-chain — admin can separately close/cancel
+ * it from the app if they also want to stop ticket sales.
+ */
+router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) => {
+  const wallet = getWallet(req);
+  const { eventPda } = req.params;
+
+  if (!validateEventPda(eventPda, res)) return;
+
+  try {
+    // Only the event admin can end the meeting
+    let eventInfo;
+    try {
+      eventInfo = await getEventInfo(eventPda);
+    } catch {
+      res.status(503).json({ error: "Blockchain temporarily unavailable. Please try again shortly." });
+      return;
+    }
+
+    if (!eventInfo || !eventInfo.exists) {
+      res.status(404).json({ error: "Event not found" });
+      return;
+    }
+
+    if (wallet.pubkey !== eventInfo.adminPubkey) {
+      res.status(403).json({ error: "Only the event admin can end the meeting" });
+      return;
+    }
+
+    const meetingRoomId = `meeting-${eventPda}`;
+    await deleteRoom(meetingRoomId);
+
+    console.log(`[Meetings] Meeting ended by admin: ${eventPda.slice(0, 8)}... (${wallet.pubkey.slice(0, 8)}...)`);
+    res.json({ ended: true });
+  } catch (error: any) {
+    console.error("[Meetings] End meeting error:", error.message);
+    res.status(500).json({ error: "Failed to end meeting" });
   }
 });
 
