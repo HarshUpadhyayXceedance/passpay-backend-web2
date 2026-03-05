@@ -69,7 +69,13 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // ── 2. Event date gate: allow entry up to 15 min before start ─────────
+    // ── 2. Check if meeting was permanently ended on-chain ────────────
+    if (eventInfo.isMeetingEnded) {
+      res.status(403).json({ error: "This meeting has ended and cannot be rejoined." });
+      return;
+    }
+
+    // ── 3. Event date gate: allow entry up to 15 min before start ─────────
     const nowSec = Math.floor(Date.now() / 1000);
     const EARLY_ENTRY_BUFFER_SEC = 15 * 60;
     if (eventInfo.eventDate > 0 && nowSec < eventInfo.eventDate - EARLY_ENTRY_BUFFER_SEC) {
@@ -82,10 +88,10 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // ── 3. Admin bypass — event creator always gets speaker rights ────────
+    // ── 4. Admin bypass — event creator always gets speaker rights ────────
     const isEventAdmin = wallet.pubkey === eventInfo.adminPubkey;
 
-    // ── 4. Ticket verification for non-admins ─────────────────────────────
+    // ── 5. Ticket verification for non-admins ─────────────────────────────
     if (!isEventAdmin) {
       let ticketStatus;
       try {
@@ -108,7 +114,7 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       // are independent. A user who confirmed attendance can still re-join the meeting.
     }
 
-    // ── 5. Find or create the meeting room ────────────────────────────────
+    // ── 6. Find or create the meeting room ────────────────────────────────
     const meetingRoomId = `meeting-${eventPda}`;
     let room = await getRoom(meetingRoomId);
 
@@ -128,14 +134,14 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       await createRoom(room);
     }
 
-    // ── 6. Check capacity ─────────────────────────────────────────────────
+    // ── 7. Check capacity ─────────────────────────────────────────────────
     const count = await getParticipantCount(meetingRoomId);
     if (count >= room.maxParticipants) {
       res.status(403).json({ error: "Meeting is full" });
       return;
     }
 
-    // ── 7. Add participant + issue LiveKit token ───────────────────────────
+    // ── 8. Add participant + issue LiveKit token ───────────────────────────
     const newCount = await addParticipant(meetingRoomId, wallet.pubkey);
     const canPublish = isEventAdmin || wallet.pubkey === room.creator;
 
@@ -206,10 +212,9 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
 /**
  * DELETE /api/meetings/:eventPda/end
  *
- * Admin-only: ends the meeting by removing the Redis room entry.
- * After this, any join attempt returns 404 "Meeting not found".
- * The event itself stays open on-chain — admin can separately close/cancel
- * it from the app if they also want to stop ticket sales.
+ * Admin-only: cleans up LiveKit room + Redis entry after the admin has
+ * already set is_meeting_ended=true on-chain via the end_meeting instruction.
+ * The on-chain flag permanently prevents rejoining.
  */
 router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);

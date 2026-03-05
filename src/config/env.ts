@@ -5,7 +5,7 @@ export const env = {
   port: parseInt(process.env.PORT || "3001", 10),
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   solanaRpcUrl: process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com",
-  programId: process.env.PROGRAM_ID || "H57pHZjc5xTpRCruvdqtRn1XfQJL3D8gYGssE4wMLDUd",
+  programId: process.env.PROGRAM_ID || "3NG6FWSQhnA5gsM4pFMft8YE6TExaFmbjmR5Ck2EQkZq",
   // Secret for signing JWTs — MUST be set in production via environment variable
   jwtSecret: process.env.JWT_SECRET || "passpay-dev-jwt-secret-change-in-production",
   // Legacy pubkey-only auth (no signature). Only enable locally during dev.

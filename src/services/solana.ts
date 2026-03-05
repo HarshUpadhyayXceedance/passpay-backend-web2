@@ -132,6 +132,7 @@ export async function getEventInfo(eventPda: string): Promise<{
   exists: boolean;
   isActive: boolean;
   isOnline: boolean;
+  isMeetingEnded: boolean;
   eventType: "online" | "offline";
   adminPubkey: string;
   /** Event start time as Unix timestamp in seconds (0 if unreadable) */
@@ -186,18 +187,26 @@ export async function getEventInfo(eventPda: string): Promise<{
   const isCancelled = info.data[offset] !== 0;
   offset += 1;
 
-  // is_online: 1 byte (added in latest deployment; fall back to venue-name for old accounts)
+  // is_online: 1 byte
   let isOnline: boolean;
   if (offset < info.data.length) {
     isOnline = info.data[offset] !== 0;
   } else {
     isOnline = venue.toLowerCase().startsWith("online");
   }
+  offset += 1;
+
+  // is_meeting_ended: 1 byte
+  let isMeetingEnded = false;
+  if (offset < info.data.length) {
+    isMeetingEnded = info.data[offset] !== 0;
+  }
 
   return {
     exists: true,
     isActive: isActive && !isCancelled,
     isOnline,
+    isMeetingEnded,
     eventType: isOnline ? "online" : "offline",
     adminPubkey,
     eventDate,
