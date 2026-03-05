@@ -1,7 +1,13 @@
 import { Router, Request, Response } from "express";
 import { walletAuth, getWallet } from "../middleware/walletAuth";
 import { getTicketStatus, getEventInfo, isValidSolanaPubkey } from "../services/solana";
-import { generateLiveKitToken, getLiveKitUrl, isLiveKitConfigured } from "../services/livekit";
+import {
+  generateLiveKitToken,
+  getLiveKitUrl,
+  isLiveKitConfigured,
+  updateParticipantPermissions,
+  deleteLiveKitRoom,
+} from "../services/livekit";
 import {
   getRoom,
   createRoom,
@@ -178,6 +184,14 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
+      // Update participant permissions server-side so the existing WebRTC
+      // connection gets canPublish=true immediately (no disconnect/reconnect needed).
+      try {
+        await updateParticipantPermissions(room.livekitRoom, wallet.pubkey, true);
+      } catch {
+        // Participant may not be in LiveKit yet — still return the token so
+        // the client can reconnect as a speaker if needed.
+      }
       token = await generateLiveKitToken(room.livekitRoom, wallet.pubkey, true);
       livekitUrl = getLiveKitUrl();
     }
@@ -224,6 +238,13 @@ router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) 
     }
 
     const meetingRoomId = `meeting-${eventPda}`;
+    const room = await getRoom(meetingRoomId);
+
+    // Force-disconnect all LiveKit participants first
+    if (room && isLiveKitConfigured()) {
+      await deleteLiveKitRoom(room.livekitRoom);
+    }
+
     await deleteRoom(meetingRoomId);
 
     console.log(`[Meetings] Meeting ended by admin: ${eventPda.slice(0, 8)}... (${wallet.pubkey.slice(0, 8)}...)`);
