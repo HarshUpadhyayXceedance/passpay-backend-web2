@@ -102,6 +102,94 @@ export async function deleteRoom(id: string): Promise<void> {
   await pipeline.exec();
 }
 
+const ROOM_CREATE_LOCK_KEY = (id: string) => `room:${id}:lock`;
+
+/**
+ * Atomically get or create a meeting room.
+ *
+ * Uses a Redis SET NX lock so that concurrent join requests for the same
+ * event cannot race through the `if (!room) createRoom()` check and produce
+ * duplicate entries. Only the request that acquires the lock creates the room;
+ * all others spin-wait (up to 3 s) and then read the room written by the winner.
+ *
+ * @param roomId   Deterministic room ID (e.g. `meeting-<eventPda>`)
+ * @param build    Factory that produces the Room object if it doesn't exist yet
+ * @returns        The existing or newly-created Room
+ */
+export async function getOrCreateRoom(
+  roomId: string,
+  build: () => Room
+): Promise<Room> {
+  const r = getRedis();
+  const lockKey = ROOM_CREATE_LOCK_KEY(roomId);
+  const LOCK_TTL_S = 10; // lock expires after 10 s if holder crashes
+  const POLL_MS = 50;    // retry interval while waiting for lock
+  const TIMEOUT_MS = 3000;
+
+  const start = Date.now();
+
+  while (true) {
+    // Fast path: room already exists — no lock needed
+    const existing = await getRoom(roomId);
+    if (existing) return existing;
+
+    // Try to acquire the creation lock (SET NX EX)
+    const acquired = await r.set(lockKey, "1", "EX", LOCK_TTL_S, "NX");
+
+    if (acquired === "OK") {
+      try {
+        // Double-check: another holder may have created it between our read and lock
+        const doubleCheck = await getRoom(roomId);
+        if (doubleCheck) return doubleCheck;
+
+        // We hold the lock and the room still doesn't exist — create it
+        const room = build();
+        await createRoom(room);
+        return room;
+      } finally {
+        // Release the lock immediately after creation
+        await r.del(lockKey);
+      }
+    }
+
+    // Lock is held by another request — wait and retry
+    if (Date.now() - start > TIMEOUT_MS) {
+      // Fallback: return whatever is in Redis now (may be null if all holders failed)
+      const fallback = await getRoom(roomId);
+      if (fallback) return fallback;
+      throw new Error("Timed out waiting for room creation lock");
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+  }
+}
+
+// ─── Verified Joiners (Rejoin Grace) ────────────────────────
+// Tracks wallets that have successfully passed ticket verification for a room.
+// Allows them to rejoin without re-verifying on-chain (e.g. after internet drop
+// or after self_check_in before the transaction finalizes).
+
+const ROOM_VERIFIED_KEY = (id: string) => `room:${id}:verified`;
+
+/**
+ * Record that a wallet has passed ticket verification for this meeting.
+ * Uses the same TTL as the room so the record expires with the session.
+ */
+export async function recordVerifiedJoiner(
+  roomId: string,
+  pubkey: string,
+  roomTtlSeconds: number
+): Promise<void> {
+  const r = getRedis();
+  await r.sadd(ROOM_VERIFIED_KEY(roomId), pubkey);
+  await r.expire(ROOM_VERIFIED_KEY(roomId), roomTtlSeconds);
+}
+
+/** Returns true if this wallet previously passed ticket verification for the room. */
+export async function isVerifiedJoiner(roomId: string, pubkey: string): Promise<boolean> {
+  return (await getRedis().sismember(ROOM_VERIFIED_KEY(roomId), pubkey)) === 1;
+}
+
 /** Add a participant to a room */
 export async function addParticipant(roomId: string, pubkey: string): Promise<number> {
   const r = getRedis();

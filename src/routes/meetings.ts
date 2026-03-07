@@ -10,12 +10,14 @@ import {
 } from "../services/livekit";
 import {
   getRoom,
-  createRoom,
+  getOrCreateRoom,
   addParticipant,
   getParticipantCount,
   getRoomWithCount,
   deleteRoom,
   checkRateLimit,
+  recordVerifiedJoiner,
+  isVerifiedJoiner,
 } from "../services/redis";
 import { env } from "../config/env";
 
@@ -92,35 +94,45 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
     const isEventAdmin = wallet.pubkey === eventInfo.adminPubkey;
 
     // ── 5. Ticket verification for non-admins ─────────────────────────────
+    const meetingRoomId = `meeting-${eventPda}`;
+
     if (!isEventAdmin) {
-      let ticketStatus;
-      try {
-        ticketStatus = await getTicketStatus(wallet.pubkey, eventPda);
-      } catch {
-        // RPC failure — don't falsely deny access; surface as a transient error
-        res.status(503).json({ error: "Unable to verify ticket ownership. Please try again shortly." });
-        return;
-      }
+      // Grace path: if this wallet has already passed verification for this meeting
+      // (recorded in Redis on their first successful join), allow them back in without
+      // hitting Solana again. This covers:
+      //   • internet drop + rejoin after self_check_in (is_checked_in = true on-chain)
+      //   • rejoin before self_check_in transaction finalizes ("finalized" lags ~25-30 slots)
+      //   • any transient RPC slowness during a reconnect
+      const alreadyVerified = await isVerifiedJoiner(meetingRoomId, wallet.pubkey);
 
-      if (!ticketStatus.hasTicket) {
-        res.status(403).json({
-          error: "No valid ticket found",
-          details: "Purchase a ticket for this event to join the meeting.",
-        });
-        return;
-      }
+      if (!alreadyVerified) {
+        let ticketStatus;
+        try {
+          ticketStatus = await getTicketStatus(wallet.pubkey, eventPda);
+        } catch {
+          // RPC failure — don't falsely deny access; surface as a transient error
+          res.status(503).json({ error: "Unable to verify ticket ownership. Please try again shortly." });
+          return;
+        }
 
-      // Note: isCheckedIn=true is allowed — attendance confirmation and room participation
-      // are independent. A user who confirmed attendance can still re-join the meeting.
+        if (!ticketStatus.hasTicket) {
+          res.status(403).json({
+            error: "No valid ticket found",
+            details: "Purchase a ticket for this event to join the meeting.",
+          });
+          return;
+        }
+        // Verification passed — record so future rejoins (after check-in / network drops)
+        // skip the on-chain round-trip. TTL = room max duration.
+        const roomTtlSeconds = Math.ceil(env.roomMaxDurationMs / 1000);
+        await recordVerifiedJoiner(meetingRoomId, wallet.pubkey, roomTtlSeconds);
+      }
     }
 
-    // ── 6. Find or create the meeting room ────────────────────────────────
-    const meetingRoomId = `meeting-${eventPda}`;
-    let room = await getRoom(meetingRoomId);
-
-    if (!room) {
+    // ── 6. Find or create the meeting room (atomic — no duplicate creation) ─
+    const room = await getOrCreateRoom(meetingRoomId, () => {
       const now = Date.now();
-      room = {
+      return {
         id: meetingRoomId,
         creator: eventInfo.adminPubkey,
         title: `Event Meeting`,
@@ -131,8 +143,7 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
         createdAt: now,
         expiresAt: now + env.roomMaxDurationMs,
       };
-      await createRoom(room);
-    }
+    });
 
     // ── 7. Check capacity ─────────────────────────────────────────────────
     const count = await getParticipantCount(meetingRoomId);
