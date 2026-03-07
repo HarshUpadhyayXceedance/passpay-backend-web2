@@ -1,15 +1,3 @@
-/**
- * walletAuth middleware
- *
- * Auth formats (in priority order):
- *
- *  1. JWT (required in production):  Authorization: Bearer <token>
- *     Issued by POST /api/auth after Phantom signs a challenge message.
- *
- *  2. Raw pubkey (dev only):  x-wallet-pubkey: <base58>
- *     No cryptographic proof. Only active when ALLOW_LEGACY_AUTH=true.
- *     NEVER enable in production — any client can impersonate any wallet.
- */
 import { Request, Response, NextFunction } from "express";
 import bs58 from "bs58";
 import { verifyToken } from "../services/jwt";
@@ -17,7 +5,6 @@ import { env } from "../config/env";
 import { WalletAuth } from "../types";
 
 export function walletAuth(req: Request, res: Response, next: NextFunction): void {
-  // ── 1. Try JWT Bearer token ───────────────────────────────────────────
   const authHeader = req.headers["authorization"] as string | undefined;
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
@@ -31,7 +18,6 @@ export function walletAuth(req: Request, res: Response, next: NextFunction): voi
     return;
   }
 
-  // ── 2. Legacy pubkey header (dev only, disabled by default) ──────────
   if (env.allowLegacyAuth) {
     const pubkeyHeader = req.headers["x-wallet-pubkey"] as string | undefined;
     if (pubkeyHeader) {
@@ -52,7 +38,6 @@ export function walletAuth(req: Request, res: Response, next: NextFunction): voi
     }
   }
 
-  // ── 3. No valid auth provided ─────────────────────────────────────────
   res.status(401).json({ error: "Authentication required. Connect your wallet." });
 }
 

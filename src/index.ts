@@ -9,16 +9,13 @@ import authRoutes from "./routes/auth";
 
 const app = express();
 
-// ─── Middleware ─────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ─── Routes ────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
 app.use("/api/rooms", roomRoutes);
 app.use("/api/meetings", meetingRoutes);
 
-// Health check
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
@@ -27,9 +24,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// ─── Start ─────────────────────────────────────────────────
 async function start() {
-  // Connect Redis
   try {
     await connectRedis();
     console.log("[Server] Redis connected");
@@ -38,7 +33,6 @@ async function start() {
     console.warn("[Server] Rooms will not persist — running in degraded mode");
   }
 
-  // Check LiveKit
   if (!isLiveKitConfigured()) {
     console.warn("[Server] LiveKit not configured — audio/video will be disabled");
     console.warn("[Server] Set LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL in .env");

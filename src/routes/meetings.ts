@@ -23,7 +23,6 @@ import { env } from "../config/env";
 
 const router = Router();
 
-/** Validate that a route param is a legitimate Solana public key. */
 function validateEventPda(eventPda: string | undefined, res: Response): boolean {
   if (!eventPda || !isValidSolanaPubkey(eventPda)) {
     res.status(400).json({ error: "Invalid event PDA — must be a valid Solana public key" });
@@ -39,7 +38,6 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
   if (!validateEventPda(eventPda, res)) return;
 
   try {
-    // ── Rate limit: max 10 join attempts per wallet per event per hour ────
     const rateKey = `rate:meeting:join:${eventPda}:${wallet.pubkey}`;
     const allowed = await checkRateLimit(rateKey, 10, 3600);
     if (!allowed) {
@@ -47,7 +45,6 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // ── 1. Verify event on-chain ──────────────────────────────────────────
     let eventInfo;
     try {
       eventInfo = await getEventInfo(eventPda);
@@ -71,13 +68,11 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // ── 2. Check if meeting was permanently ended on-chain ────────────
     if (eventInfo.isMeetingEnded) {
       res.status(403).json({ error: "This meeting has ended and cannot be rejoined." });
       return;
     }
 
-    // ── 3. Event date gate: allow entry up to 15 min before start ─────────
     const nowSec = Math.floor(Date.now() / 1000);
     const EARLY_ENTRY_BUFFER_SEC = 15 * 60;
     if (eventInfo.eventDate > 0 && nowSec < eventInfo.eventDate - EARLY_ENTRY_BUFFER_SEC) {
@@ -90,19 +85,11 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       return;
     }
 
-    // ── 4. Admin bypass — event creator always gets speaker rights ────────
     const isEventAdmin = wallet.pubkey === eventInfo.adminPubkey;
 
-    // ── 5. Ticket verification for non-admins ─────────────────────────────
     const meetingRoomId = `meeting-${eventPda}`;
 
     if (!isEventAdmin) {
-      // Grace path: if this wallet has already passed verification for this meeting
-      // (recorded in Redis on their first successful join), allow them back in without
-      // hitting Solana again. This covers:
-      //   • internet drop + rejoin after self_check_in (is_checked_in = true on-chain)
-      //   • rejoin before self_check_in transaction finalizes ("finalized" lags ~25-30 slots)
-      //   • any transient RPC slowness during a reconnect
       const alreadyVerified = await isVerifiedJoiner(meetingRoomId, wallet.pubkey);
 
       if (!alreadyVerified) {
@@ -110,7 +97,6 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
         try {
           ticketStatus = await getTicketStatus(wallet.pubkey, eventPda);
         } catch {
-          // RPC failure — don't falsely deny access; surface as a transient error
           res.status(503).json({ error: "Unable to verify ticket ownership. Please try again shortly." });
           return;
         }
@@ -122,14 +108,11 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
           });
           return;
         }
-        // Verification passed — record so future rejoins (after check-in / network drops)
-        // skip the on-chain round-trip. TTL = room max duration.
         const roomTtlSeconds = Math.ceil(env.roomMaxDurationMs / 1000);
         await recordVerifiedJoiner(meetingRoomId, wallet.pubkey, roomTtlSeconds);
       }
     }
 
-    // ── 6. Find or create the meeting room (atomic — no duplicate creation) ─
     const room = await getOrCreateRoom(meetingRoomId, () => {
       const now = Date.now();
       return {
@@ -145,14 +128,12 @@ router.post("/:eventPda/join", walletAuth, async (req: Request, res: Response) =
       };
     });
 
-    // ── 7. Check capacity ─────────────────────────────────────────────────
     const count = await getParticipantCount(meetingRoomId);
     if (count >= room.maxParticipants) {
       res.status(403).json({ error: "Meeting is full" });
       return;
     }
 
-    // ── 8. Add participant + issue LiveKit token ───────────────────────────
     const newCount = await addParticipant(meetingRoomId, wallet.pubkey);
     const canPublish = isEventAdmin || wallet.pubkey === room.creator;
 
@@ -182,7 +163,6 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
   if (!validateEventPda(eventPda, res)) return;
 
   try {
-    // ── Rate limit: 5 speaker requests per wallet per event per 10 min ────
     const rateKey = `rate:meeting:speak:${eventPda}:${wallet.pubkey}`;
     const allowed = await checkRateLimit(rateKey, 5, 600);
     if (!allowed) {
@@ -201,13 +181,9 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
-      // Update participant permissions server-side so the existing WebRTC
-      // connection gets canPublish=true immediately (no disconnect/reconnect needed).
       try {
         await updateParticipantPermissions(room.livekitRoom, wallet.pubkey, true);
       } catch {
-        // Participant may not be in LiveKit yet — still return the token so
-        // the client can reconnect as a speaker if needed.
       }
       token = await generateLiveKitToken(room.livekitRoom, wallet.pubkey, true);
       livekitUrl = getLiveKitUrl();
@@ -220,12 +196,6 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
   }
 });
 
-/**
- * POST /api/meetings/:eventPda/revoke-speak
- *
- * Admin-only: revokes speaking permission from a participant,
- * setting canPublish=false on their LiveKit connection.
- */
 router.post("/:eventPda/revoke-speak", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const { eventPda } = req.params;
@@ -252,7 +222,6 @@ router.post("/:eventPda/revoke-speak", walletAuth, async (req: Request, res: Res
       return;
     }
 
-    // Only the event admin can revoke speaking permission
     if (wallet.pubkey !== eventInfo.adminPubkey) {
       res.status(403).json({ error: "Only the event admin can revoke speaking access" });
       return;
@@ -278,13 +247,6 @@ router.post("/:eventPda/revoke-speak", walletAuth, async (req: Request, res: Res
   }
 });
 
-/**
- * DELETE /api/meetings/:eventPda/end
- *
- * Admin-only: cleans up LiveKit room + Redis entry after the admin has
- * already set is_meeting_ended=true on-chain via the end_meeting instruction.
- * The on-chain flag permanently prevents rejoining.
- */
 router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const { eventPda } = req.params;
@@ -292,7 +254,6 @@ router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) 
   if (!validateEventPda(eventPda, res)) return;
 
   try {
-    // Only the event admin can end the meeting
     let eventInfo;
     try {
       eventInfo = await getEventInfo(eventPda);
@@ -314,7 +275,6 @@ router.delete("/:eventPda/end", walletAuth, async (req: Request, res: Response) 
     const meetingRoomId = `meeting-${eventPda}`;
     const room = await getRoom(meetingRoomId);
 
-    // Force-disconnect all LiveKit participants first
     if (room && isLiveKitConfigured()) {
       await deleteLiveKitRoom(room.livekitRoom);
     }

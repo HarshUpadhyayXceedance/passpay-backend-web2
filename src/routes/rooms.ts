@@ -19,14 +19,9 @@ import { CreateRoomBody } from "../types";
 
 const router = Router();
 
-/**
- * GET /api/rooms
- * List all active community rooms (no auth required for browsing)
- */
 router.get("/", async (_req: Request, res: Response) => {
   try {
     const rooms = await listActiveRooms();
-    // Only return public rooms in the list (ticket rooms are accessed via meetings)
     const publicRooms = rooms.filter((r) => r.type === "public");
     res.json({ rooms: publicRooms });
   } catch (error: any) {
@@ -35,10 +30,6 @@ router.get("/", async (_req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /api/rooms/:id
- * Get a single room's details
- */
 router.get("/:id", async (req: Request, res: Response) => {
   try {
     const room = await getRoomWithCount(req.params.id);
@@ -53,10 +44,6 @@ router.get("/:id", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /api/rooms
- * Create a new community room (requires wallet auth)
- */
 router.post("/", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const body = req.body as CreateRoomBody;
@@ -82,7 +69,6 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
   }
 
   try {
-    // Rate limit: max 5 room creations per wallet per hour
     const createRateKey = `rate:rooms:create:${wallet.pubkey}`;
     const allowed = await checkRateLimit(createRateKey, 5, 3600);
     if (!allowed) {
@@ -108,10 +94,8 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
 
     await createRoom(room);
 
-    // Auto-join the creator
     await addParticipant(roomId, wallet.pubkey);
 
-    // Community rooms: creator (and all members) are speakers — mic state determines label
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
@@ -131,16 +115,11 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /api/rooms/:id/join
- * Join a community room and get a LiveKit token (requires wallet auth)
- */
 router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const roomId = req.params.id;
 
   try {
-    // Rate limit: max 20 join attempts per wallet per hour across all rooms
     const joinRateKey = `rate:rooms:join:${wallet.pubkey}`;
     const joinAllowed = await checkRateLimit(joinRateKey, 20, 3600);
     if (!joinAllowed) {
@@ -154,7 +133,6 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
       return;
     }
 
-    // Seeker token gate: verify SKR ownership on mainnet before granting access
     if (room.isSeekerGated) {
       try {
         const holdsSKR = await verifySeekerToken(wallet.pubkey);
@@ -172,18 +150,14 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
       }
     }
 
-    // Check capacity
     const count = await getParticipantCount(roomId);
     if (count >= room.maxParticipants) {
       res.status(403).json({ error: "Room is full" });
       return;
     }
 
-    // Add participant
     const newCount = await addParticipant(roomId, wallet.pubkey);
 
-    // Community rooms: all members are speakers (can publish audio/video)
-    // Mic state on the client determines speaker vs listener label
     let token: string | null = null;
     let livekitUrl: string | null = null;
     if (isLiveKitConfigured()) {
@@ -203,10 +177,6 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /api/rooms/:id/leave
- * Leave a room (requires wallet auth)
- */
 router.post("/:id/leave", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const roomId = req.params.id;
@@ -219,7 +189,6 @@ router.post("/:id/leave", walletAuth, async (req: Request, res: Response) => {
     }
 
     const remaining = await removeParticipant(roomId, wallet.pubkey);
-    // Do NOT auto-delete empty rooms — rely on Redis TTL so creators can re-join after app restarts
     res.json({ success: true, participantCount: remaining });
   } catch (error: any) {
     console.error("[Rooms] Leave error:", error.message);
@@ -227,10 +196,6 @@ router.post("/:id/leave", walletAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * DELETE /api/rooms/:id
- * Close a room (creator only, requires wallet auth)
- */
 router.delete("/:id", walletAuth, async (req: Request, res: Response) => {
   const wallet = getWallet(req);
   const roomId = req.params.id;
