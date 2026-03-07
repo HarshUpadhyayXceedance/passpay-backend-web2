@@ -21,4 +21,8 @@ export const env = {
   roomDefaultMaxParticipants: 50,
   meetingTokenTtlSeconds: 30 * 60, // 30 minutes
   signatureMaxAgeSeconds: 60, // signatures must be < 60s old
+  // Solana mainnet RPC for SKR token verification (Seeker-gated rooms)
+  solanaMainnetRpcUrl: process.env.SOLANA_MAINNET_RPC_URL || "https://api.mainnet-beta.solana.com",
+  // Official Solana Mobile Seeker (SKR) token mint on mainnet
+  skrMintAddress: process.env.SKR_MINT_ADDRESS || "SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3",
 } as const;

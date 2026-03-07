@@ -13,6 +13,7 @@ import {
   checkRateLimit,
 } from "../services/redis";
 import { generateLiveKitToken, getLiveKitUrl, isLiveKitConfigured } from "../services/livekit";
+import { verifySeekerToken } from "../services/solana";
 import { env } from "../config/env";
 import { CreateRoomBody } from "../types";
 
@@ -98,6 +99,7 @@ router.post("/", walletAuth, async (req: Request, res: Response) => {
       title: body.title.trim(),
       type: (body.type || "public") as "public" | "ticket",
       eventPda: body.eventPda,
+      isSeekerGated: body.isSeekerGated === true,
       livekitRoom: `passpay-${roomId}`,
       maxParticipants: Math.min(body.maxParticipants || env.roomDefaultMaxParticipants, 100),
       createdAt: now,
@@ -150,6 +152,24 @@ router.post("/:id/join", walletAuth, async (req: Request, res: Response) => {
     if (!room) {
       res.status(404).json({ error: "Room not found or expired" });
       return;
+    }
+
+    // Seeker token gate: verify SKR ownership on mainnet before granting access
+    if (room.isSeekerGated) {
+      try {
+        const holdsSKR = await verifySeekerToken(wallet.pubkey);
+        if (!holdsSKR) {
+          res.status(403).json({
+            error: "SEEKER_REQUIRED",
+            details: "This room is exclusive to Seeker (SKR) token holders.",
+          });
+          return;
+        }
+      } catch (rpcError: any) {
+        console.error("[Rooms] SKR verification RPC error:", rpcError.message);
+        res.status(503).json({ error: "Could not verify Seeker token. Please try again." });
+        return;
+      }
     }
 
     // Check capacity

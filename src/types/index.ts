@@ -5,6 +5,7 @@ export interface Room {
   title: string;
   type: "public" | "ticket"; // public = community, ticket = event-gated
   eventPda?: string; // only for ticket-gated rooms
+  isSeekerGated?: boolean; // true = only SKR token holders can join
   livekitRoom: string; // LiveKit room name
   maxParticipants: number;
   createdAt: number; // unix ms
@@ -29,6 +30,7 @@ export interface CreateRoomBody {
   type: "public" | "ticket";
   eventPda?: string;
   maxParticipants?: number;
+  isSeekerGated?: boolean;
 }
 
 /** Request body for joining a room or meeting */

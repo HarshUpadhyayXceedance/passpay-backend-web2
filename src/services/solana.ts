@@ -6,8 +6,7 @@ const PROGRAM_ID = new PublicKey(env.programId);
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TICKET_SEED = Buffer.from("ticket");
 
-// Singleton connection — recreated if an RPC error forces a reset.
-// Both functions use "finalized" so reads are consistent with on-chain finality.
+// Devnet connection for ticket/event verification
 let connection: Connection | null = null;
 
 function getConnection(): Connection {
@@ -17,9 +16,48 @@ function getConnection(): Connection {
   return connection;
 }
 
-/** Call after an unexpected RPC error so the next request gets a fresh connection. */
 function resetConnection(): void {
   connection = null;
+}
+
+// Separate mainnet connection for SKR token verification (Seeker-gated rooms)
+let mainnetConnection: Connection | null = null;
+
+function getMainnetConnection(): Connection {
+  if (!mainnetConnection) {
+    mainnetConnection = new Connection(env.solanaMainnetRpcUrl, "confirmed");
+  }
+  return mainnetConnection;
+}
+
+function resetMainnetConnection(): void {
+  mainnetConnection = null;
+}
+
+/**
+ * Verify that a wallet holds the Seeker (SKR) token on Solana mainnet.
+ * A single getTokenAccountsByOwner call filtered by the SKR mint is sufficient.
+ * Returns true if the wallet has any SKR balance > 0.
+ * @throws if the RPC call fails (network error, rate limit, etc.)
+ */
+export async function verifySeekerToken(userPubkey: string): Promise<boolean> {
+  const conn = getMainnetConnection();
+  const user = new PublicKey(userPubkey);
+  const skrMint = new PublicKey(env.skrMintAddress);
+
+  let tokenAccounts;
+  try {
+    tokenAccounts = await conn.getTokenAccountsByOwner(user, { mint: skrMint });
+  } catch (error: any) {
+    resetMainnetConnection();
+    throw new Error(`[Solana] RPC error checking SKR balance: ${error.message}`);
+  }
+
+  for (const { account } of tokenAccounts.value) {
+    const data = AccountLayout.decode(account.data);
+    if (data.amount > 0n) return true;
+  }
+  return false;
 }
 
 /** Returns true when `str` is a valid 32-byte Solana base58 public key. */
