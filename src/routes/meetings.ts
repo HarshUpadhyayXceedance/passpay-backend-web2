@@ -210,6 +210,64 @@ router.post("/:eventPda/request-speak", walletAuth, async (req: Request, res: Re
 });
 
 /**
+ * POST /api/meetings/:eventPda/revoke-speak
+ *
+ * Admin-only: revokes speaking permission from a participant,
+ * setting canPublish=false on their LiveKit connection.
+ */
+router.post("/:eventPda/revoke-speak", walletAuth, async (req: Request, res: Response) => {
+  const wallet = getWallet(req);
+  const { eventPda } = req.params;
+  const { targetPubkey } = req.body;
+
+  if (!validateEventPda(eventPda, res)) return;
+
+  if (!targetPubkey || !isValidSolanaPubkey(targetPubkey)) {
+    res.status(400).json({ error: "Invalid target pubkey" });
+    return;
+  }
+
+  try {
+    let eventInfo;
+    try {
+      eventInfo = await getEventInfo(eventPda);
+    } catch {
+      res.status(503).json({ error: "Blockchain temporarily unavailable. Please try again shortly." });
+      return;
+    }
+
+    if (!eventInfo || !eventInfo.exists) {
+      res.status(404).json({ error: "Event not found" });
+      return;
+    }
+
+    // Only the event admin can revoke speaking permission
+    if (wallet.pubkey !== eventInfo.adminPubkey) {
+      res.status(403).json({ error: "Only the event admin can revoke speaking access" });
+      return;
+    }
+
+    const meetingRoomId = `meeting-${eventPda}`;
+    const room = await getRoom(meetingRoomId);
+
+    if (!room) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+
+    if (isLiveKitConfigured()) {
+      await updateParticipantPermissions(room.livekitRoom, targetPubkey, false);
+    }
+
+    console.log(`[Meetings] Speaking revoked: ${targetPubkey.slice(0, 8)}... by admin ${wallet.pubkey.slice(0, 8)}...`);
+    res.json({ revoked: true });
+  } catch (error: any) {
+    console.error("[Meetings] Revoke speak error:", error.message);
+    res.status(500).json({ error: "Failed to revoke speaking access" });
+  }
+});
+
+/**
  * DELETE /api/meetings/:eventPda/end
  *
  * Admin-only: cleans up LiveKit room + Redis entry after the admin has
