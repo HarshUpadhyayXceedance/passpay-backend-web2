@@ -199,3 +199,31 @@ export async function checkRateLimit(
   }
   return count <= limit;
 }
+
+export const SEEKER_ROOM_ID = "seeker-room";
+const SEEKER_ROOM_TTL_S = 30 * 24 * 3600;
+
+export async function ensureSeekerRoom(): Promise<void> {
+  const r = getRedis();
+  const exists = await r.exists(ROOM_KEY(SEEKER_ROOM_ID));
+  if (exists) {
+    await r.expire(ROOM_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
+    await r.expire(ROOM_PARTICIPANTS_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
+    return;
+  }
+  const now = Date.now();
+  const room: Room = {
+    id: SEEKER_ROOM_ID,
+    creator: "passpay-system",
+    title: "Seeker Room",
+    type: "public",
+    isSeekerGated: true,
+    livekitRoom: `passpay-${SEEKER_ROOM_ID}`,
+    maxParticipants: 100,
+    createdAt: now,
+    expiresAt: now + SEEKER_ROOM_TTL_S * 1000,
+  };
+  await createRoom(room);
+  await r.expire(ROOM_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
+  await r.expire(ROOM_PARTICIPANTS_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
+}

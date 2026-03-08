@@ -11,6 +11,8 @@ import {
   removeParticipant,
   getParticipantCount,
   checkRateLimit,
+  ensureSeekerRoom,
+  SEEKER_ROOM_ID,
 } from "../services/redis";
 import { generateLiveKitToken, getLiveKitUrl, isLiveKitConfigured } from "../services/livekit";
 import { verifySeekerToken } from "../services/solana";
@@ -21,6 +23,7 @@ const router = Router();
 
 router.get("/", async (_req: Request, res: Response) => {
   try {
+    await ensureSeekerRoom();
     const rooms = await listActiveRooms();
     const publicRooms = rooms.filter((r) => r.type === "public");
     res.json({ rooms: publicRooms });
@@ -204,6 +207,11 @@ router.delete("/:id", walletAuth, async (req: Request, res: Response) => {
     const room = await getRoom(roomId);
     if (!room) {
       res.status(404).json({ error: "Room not found or expired" });
+      return;
+    }
+
+    if (roomId === SEEKER_ROOM_ID) {
+      res.status(403).json({ error: "The Seeker Room cannot be closed." });
       return;
     }
 
