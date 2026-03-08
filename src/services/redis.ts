@@ -201,7 +201,7 @@ export async function checkRateLimit(
 }
 
 export const SEEKER_ROOM_ID = "seeker-room";
-const SEEKER_ROOM_TTL_S = 30 * 24 * 3600;
+const SEEKER_ROOM_TTL_S = 60 * 24 * 3600;
 
 export async function ensureSeekerRoom(): Promise<void> {
   const r = getRedis();
@@ -209,6 +209,7 @@ export async function ensureSeekerRoom(): Promise<void> {
   if (exists) {
     await r.expire(ROOM_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
     await r.expire(ROOM_PARTICIPANTS_KEY(SEEKER_ROOM_ID), SEEKER_ROOM_TTL_S);
+    await r.zadd(ACTIVE_ROOMS_KEY, Date.now(), SEEKER_ROOM_ID);
     return;
   }
   const now = Date.now();
