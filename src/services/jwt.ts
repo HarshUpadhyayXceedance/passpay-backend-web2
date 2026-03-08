@@ -7,7 +7,7 @@ interface JWTPayload {
 }
 
 function b64url(buf: Buffer): string {
-  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function hmac(secret: string, data: string): Buffer {
